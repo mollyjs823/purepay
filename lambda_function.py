@@ -4,7 +4,13 @@ import uuid
 import random
 from decimal import Decimal, ROUND_HALF_UP
 from botocore.exceptions import ClientError
-from boto3.dynamodb.conditions import Key, Attr
+from boto3.dynamodb.conditions import Key
+
+DY_DB = boto3.resource('dynamodb')
+TRANSACTION_TABLE = DY_DB.Table('transactions')
+MERCHANT_TABLE = DY_DB.Table('merchants')
+BANKS_TABLE = DY_DB.Table('banks')
+BANK_FAILURE_RATE = 30
 
 def lambda_handler(event, context):
     response = {}
@@ -23,108 +29,76 @@ def lambda_handler(event, context):
             if None in [bank, merchant_name, cc_num, merchant_token, security_code, amount, card_zip, timestamp]:
                 raise ValueError("Please enter all fields")
             
-            dynamo_db = boto3.resource('dynamodb')
-            
-            transaction_table = dynamo_db.Table('transactions')
-            
-            merchant_table = dynamo_db.Table('merchants')
-            banks_table = dynamo_db.Table('banks')
-            
-            merchant_id = merchant_table.get_item(
-                Key={
-                    'merchant_name': merchant_name
-                }).get('Item', {}).get('id', '')
+            merchant_id = get_merchant_id(merchant_name)
             
             try:
                 amount = float(amount)
                 cc_num = int(cc_num)
             except ValueError:
-                record_transaction(merchant_name, merchant_id, cc_num, "Unknown", amount, timestamp, "error", transaction_table)
+                record_transaction(merchant_name, merchant_id, cc_num, "Unknown", amount, timestamp, "error")
                 return {
                     "statusCode": 404,
                     "body": json.dumps({"error": "Account not found", "details": "The specified bank or credit account does not exist"})
                 }
 
-            card_type = banks_table.get_item(
-                Key={
-                    'bankName': bank, 
-                    'accountID': cc_num
-                }
-            )
-            card_type = card_type.get('Item', {}).get('type', '')
+            card_type = get_card_type(bank, cc_num)
 
-            if not merchant_auth(merchant_name, merchant_token, merchant_table):
-                record_transaction(merchant_name, None, cc_num, card_type, amount, timestamp, "merchant unauthorized", transaction_table)
+            if not merchant_auth(merchant_name, merchant_token):
+                record_transaction(merchant_name, None, cc_num, card_type, amount, timestamp, "merchant unauthorized")
                 return {
                     "statusCode": 401,
                     "body": json.dumps({"error": "Unauthorized", "details": "Merchant not authorized"})
                 }
             
-            
-            
             if (len(str(security_code)) < 3):
-                record_transaction(merchant_name, merchant_id, cc_num, card_type, amount, timestamp, "error", transaction_table)
+                record_transaction(merchant_name, merchant_id, cc_num, card_type, amount, timestamp, "error")
                 return {
                     "statusCode": 401,
                     "body": json.dumps({"error": "Unauthorized", "details": "Invalid security code"})
                 }
     
-            response = banks_table.query(KeyConditionExpression=Key('bankName').eq(bank) & Key('accountID').eq(cc_num))
-            bank_info = response['Items'][0] if response['Items'] else None
+            bank_info = get_bank_info(bank, cc_num)
             if not bank_info:
-                record_transaction(merchant_name, merchant_id, cc_num, card_type, amount, timestamp, "error", transaction_table)
+                record_transaction(merchant_name, merchant_id, cc_num, card_type, amount, timestamp, "error")
                 return {
                     "statusCode": 404,
                     "body": json.dumps({"error": "Account not found", "details": "The specified bank or credit account does not exist"})
                 }
             
             if (card_type.lower() == "credit"):
-                credit_used = float(bank_info.get('creditUsed', 0))
-                credit_limit = float(bank_info.get('creditLimit', 0))
-                if credit_limit - credit_used < amount:
-                    record_transaction(merchant_name, merchant_id, cc_num, card_type, amount, timestamp, "declined", transaction_table)
+                new_credit = verify_credit(bank_info, amount, cc_num)
+                if (new_credit == "insufficient_funds"):
+                    record_transaction(merchant_name, merchant_id, cc_num, card_type, amount, timestamp, "declined")
                     return {
                         "statusCode": 402,
                         "body": json.dumps({"error": "Insufficient credit", "details": "Not enough available credit for this transaction"})
                     }
-    
-                new_credit_used = credit_used + amount
-                new_credit_decimal = Decimal(str(new_credit_used)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-                bank_failure_rate = 30
-                if (random.randrange(0, 100) > bank_failure_rate): 
-                    banks_table.update_item(
-                        Key={
-                            'bankName': bank,
-                            'accountID': cc_num
-                        },
-                        UpdateExpression='SET creditUsed = :val',
-                        ExpressionAttributeValues={':val': new_credit_decimal}
-                    )
-                else:
-                    record_transaction(merchant_name, merchant_id, cc_num, card_type, amount, timestamp, "bank failure", transaction_table)
+                elif (new_credit == "bank_failure"):
+                    record_transaction(merchant_name, merchant_id, cc_num, card_type, amount, timestamp, "bank failure")
                     return {
                         "statusCode": 500,
                         "body": json.dumps({"error": "Bank Error", "details": "The bank is unavailable"})
                     }
             else:
-                balance = float(bank_info.get('balance', 0))
-                if balance < amount:
-                    record_transaction(merchant_name, merchant_id, cc_num, card_type, amount, timestamp, "declined", transaction_table)
+                new_balance = verify_balance(bank_info, amount, cc_num)
+                if (new_balance == "insufficient_funds"):
+                    record_transaction(merchant_name, merchant_id, cc_num, card_type, amount, timestamp, "declined")
                     return {
                         "statusCode": 402,
                         "body": json.dumps({"error": "Insufficient funds", "details": "Not enough funds available for this transaction"})
                     }
-                new_balance = balance - amount
-                new_balance_decimal = Decimal(str(new_balance)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-                banks_table.update_item(
-                    Key={
-                        'bankName': bank,
-                        'accountID': cc_num
-                    },
-                    UpdateExpression='SET balance = :val',
-                    ExpressionAttributeValues={':val': new_balance_decimal}
-                )
-            
+                elif (new_balance == "bank_failure"):
+                    record_transaction(merchant_name, merchant_id, cc_num, card_type, amount, timestamp, "bank failure")
+                    return {
+                        "statusCode": 500,
+                        "body": json.dumps({"error": "Bank Error", "details": "The bank is unavailable"})
+                    }
+            record_transaction(merchant_name, merchant_id, cc_num, card_type, amount, timestamp, "approved")
+            res = {
+                "statusCode": 200,
+                "body": "Approved"
+            }
+            return res             
         except json.JSONDecodeError as e:
             return {
                 "statusCode": 400,
@@ -150,18 +124,11 @@ def lambda_handler(event, context):
                 "statusCode": 400,
                 "body": json.dumps({"error": "An error occurred", "details": "Your request is not formatted correctly"})
             }
-    
-    record_transaction(merchant_name, merchant_id, cc_num, card_type, amount, timestamp, "approved", transaction_table)
-    res = {
-        "statusCode": 200,
-        "body": "Approved"
-    }
-    return res
-    
+     
 
-def merchant_auth(name, token, table):
+def merchant_auth(name, token):
     try:
-        response = table.get_item(
+        response = MERCHANT_TABLE.get_item(
             Key={
                 'merchant_name': name
             }
@@ -171,8 +138,7 @@ def merchant_auth(name, token, table):
     except ClientError as e:
         return False
 
-
-def record_transaction(name, merch_id, account, card_type, amount, timestamp, status, table):
+def record_transaction(name, merch_id, account, card_type, amount, timestamp, status):
     amount = Decimal("{:.2f}".format(float(amount)))
     account = str(account)
     account = account[-4:]
@@ -189,6 +155,64 @@ def record_transaction(name, merch_id, account, card_type, amount, timestamp, st
     }
     print(item)
     try:
-        table.put_item(Item=item)
+        TRANSACTION_TABLE.put_item(Item=item)
     except Exception as e:
         print(f"Error recording transaction: {e}")
+
+def get_merchant_id(merchant_name):
+    return MERCHANT_TABLE.get_item(
+    Key={
+        'merchant_name': merchant_name
+    }).get('Item', {}).get('id', '')
+
+def get_card_type(bank, cc_num):
+    card_type = BANKS_TABLE.get_item(
+        Key={
+            'bankName': bank, 
+            'accountID': cc_num
+        }
+    )
+    card_type = card_type.get('Item', {}).get('type', '')
+
+def get_bank_info(bank, cc_num):
+    response = BANKS_TABLE.query(KeyConditionExpression=Key('bankName').eq(bank) & Key('accountID').eq(cc_num))
+    return response['Items'][0] if response['Items'] else None
+
+def verify_credit(bank_info, amount, cc_num):
+    credit_used = float(bank_info.get('creditUsed', 0))
+    credit_limit = float(bank_info.get('creditLimit', 0))
+    if credit_limit - credit_used < amount:
+        return "insufficient_funds"
+    new_credit_used = credit_used + amount
+    new_credit_decimal = Decimal(str(new_credit_used)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    if (random.randrange(0, 100) > BANK_FAILURE_RATE): 
+        BANKS_TABLE.update_item(
+            Key={
+                'bankName': bank_info.get('bankName'),
+                'accountID': cc_num
+            },
+            UpdateExpression='SET creditUsed = :val',
+            ExpressionAttributeValues={':val': new_credit_decimal}
+        )
+        return True
+    return "bank_failure"
+    
+def verify_balance(bank_info, amount, cc_num):
+    balance = float(bank_info.get('balance', 0))
+    if balance < amount:
+        return "insufficient_funds"
+    new_balance = balance - amount
+    new_balance_decimal = Decimal(str(new_balance)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    if (random.randrange(0, 100) > BANK_FAILURE_RATE):
+        BANKS_TABLE.update_item(
+            Key={
+                'bankName': bank_info.get("bankName"),
+                'accountID': cc_num
+            },
+            UpdateExpression='SET balance = :val',
+            ExpressionAttributeValues={':val': new_balance_decimal}
+        )
+        return True
+    return "bank_failure"
+
+
