@@ -173,6 +173,7 @@ def get_card_type(bank, cc_num):
         }
     )
     card_type = card_type.get('Item', {}).get('type', '')
+    return card_type
 
 def get_bank_info(bank, cc_num):
     response = BANKS_TABLE.query(KeyConditionExpression=Key('bankName').eq(bank) & Key('accountID').eq(cc_num))
